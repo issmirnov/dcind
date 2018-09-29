@@ -76,6 +76,10 @@ start_docker() {
     echo waiting for docker to come up...
     sleep 1
   done
+
+  # issmirnov's changes - add systemd support.
+  mkdir /sys/fs/cgroup/systemd
+  mount -t cgroup -o none,name=systemd cgroup /sys/fs/cgroup/systemd
 }
 
 stop_docker() {

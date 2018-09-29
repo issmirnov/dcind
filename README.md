@@ -1,65 +1,95 @@
 # dcind (Docker-Compose-in-Docker)
 
-[![](https://images.microbadger.com/badges/image/amidos/dcind.svg)](http://microbadger.com/images/amidos/dcind "Get your own image badge on microbadger.com")
+Forked from [meAmidos/dcind](https://github.com/meAmidos/dcind).
 
-Use this ```Dockerfile``` to build a base image for your integration tests in [Concourse CI](http://concourse.ci/). Alternatively, you can use a ready-to-use image from the Docker Hub: [amidos/dcind](https://hub.docker.com/r/amidos/dcind/). The image is Alpine based.
+## Changes from Upstream
 
-Here is an example of a Concourse [job](http://concourse.ci/concepts.html) that uses ```amidos/dcind``` image to run a bunch of containers in a task, and then runs the integration test suite. You can find a full version of this example in the [```example```](example) directory.
+- Add `jq` and `git`, since we need to run [ansible-role-tester](https://github.com/fubarhouse/ansible-role-tester) and parse the report.
+- Create `systemd` cgroup for ubuntu1804 support in images.
+
+## Sample Pipeline
 
 ```yaml
-  - name: integration
+resources:
+  - name: issmirnov.compile_zsh
+    type: git
+    source:
+      uri: https://github.com/issmirnov/ansible-role-compile-zsh.git
+      branch: master
+
+jobs:
+  - name: issmirnov.compile_zsh
     plan:
       - aggregate:
-        - get: code
+        - get: ansible-role-compile-zsh
+          resource: issmirnov.compile_zsh
           params: {depth: 1}
-          passed: [unit-tests]
           trigger: true
-        - get: redis
-          params: {save: true}
-        - get: busybox
-          params: {save: true}
-      - task: Run integration tests
-        privileged: true
+      - task: compile ansible-role-test binary
         config:
-          platform: linux
-          image_resource:
-            type: docker-image
-            source:
-              repository: amidos/dcind
+          <<: *compile_art
+      - task: run ansible-role-tester
+        privileged: true
+        params:
+          ROLE: ansible-role-compile-zsh
+        config:
+          <<: *ansible_role_tester
           inputs:
-            - name: code
-            - name: redis
-            - name: busybox
-          run:
-            path: sh
-            args:
-              - -exc
-              - |
-                source /docker-lib.sh
-                start_docker
+            - name: art_bin
+            - name: ansible-role-compile-zsh
+          outputs:
+            - name: report
 
-                # Strictly speaking, preloading of Docker images is not required.
-                # However, you might want to do this for a couple of reasons:
-                # - If the image comes from a private repository, it is much easier to let Concourse pull it,
-                #   and then pass it through to the task.
-                # - When the image is passed to the task, Concourse can often get the image from its cache.
-                docker load -i redis/image
-                docker tag "$(cat redis/image-id)" "$(cat redis/repository):$(cat redis/tag)"
+# Compile ansible-role-tester
+compile_art: &compile_art
+  platform: linux
+  image_resource:
+    type: docker-image
+    source:
+      repository: golang
+      tag:  1.9.3
+  outputs:
+    - name: art_bin
+  run:
+    path: sh
+    args:
+      - -exc
+      - |
+        export ROOT=$PWD
+        export GOPATH=$PWD
+        go get github.com/fubarhouse/ansible-role-tester
+        cd src/github.com/fubarhouse/ansible-role-tester
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build  -ldflags '-w -extldflags "-static"'
+        cp ansible-role-tester $ROOT/art_bin/
 
-                docker load -i busybox/image
-                docker tag "$(cat busybox/image-id)" "$(cat busybox/repository):$(cat busybox/tag)"
+# Define job to run ansible-role-tester        
+ansible_role_tester: &ansible_role_tester
+  platform: linux
+  image_resource:
+    type: docker-image
+    source:
+      repository: issmirnov/dcind
+  run:
+    path: sh
+    args:
+      - -exc
+      - |
+        source /docker-lib.sh > /dev/null 2>&1
+        start_docker > /dev/null 2>&1
 
-                # This is just to visually check in the log that images have been loaded successfully
-                docker images
+        mkdir -p report # output
+        export ROOT=$PWD
+        cp art_bin/ansible-role-tester $ROLE
+        cd $ROLE
 
-                # Run the container with tests and its dependencies.
-                docker-compose -f code/example/integration.yml run tests
+        ./ansible-role-tester full -t ubuntu1804 --extra-roles $ROOT --library "$(pwd)/tests/library" --report --report-output ../report/report.json
 
-                # Cleanup.
-                # Not sure if this is required.
-                # It's quite possible that Concourse is smart enough to clean up the Docker mess itself.
-                docker-compose -f code/example/integration.yml down
-                docker volume rm $(docker volume ls -q)
-
-
+        if [[ "$(jq '.Ansible.Run.Result' ../report/report.json)" != "true" ]]; then
+            echo "Run failed";
+            exit 1;
+        fi
+        if [[ "$(jq '.Ansible.Idempotence.Result' ../report/report.json)" != "true" ]]; then
+            echo "Idempotence failed";
+            exit 2;
+        fi
 ```
